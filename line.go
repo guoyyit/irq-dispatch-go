@@ -120,6 +120,24 @@ func (l *irqLine) hasPending() bool {
 	return ok
 }
 
+// undelivered 报告指定来源是否存在尚未投递的触发状态：
+// 边缘触发为“待投递且未在途”，电平触发为“已置位且未上报”。
+func (l *irqLine) undelivered(source SourceID) bool {
+	if l.cfg.Mode == EdgeTriggered {
+		return l.edges[source] == edgePending && !l.inflight[source]
+	}
+	return l.levelAsserted[source] && !l.levelReported[source]
+}
+
+// markRearmed 在来源投递在途期间把一次限速放行折算为滞留，
+// 例程返回后由 markDelivered 触发恰好一次补投，存在性不丢失。
+func (l *irqLine) markRearmed(source SourceID) {
+	if l.cfg.Mode != EdgeTriggered || !l.inflight[source] {
+		return
+	}
+	l.edges[source] = edgeRearmed
+}
+
 // beginDispatch 在调度临界区内原子地开始一次投递：
 // 置位 inflight 并把 pending 切换为 active。返回 false 表示当前无可投递脉冲。
 // 此后到达的边缘由 raise 记为 rearmed，从而既不重复派发也不丢失存在性。

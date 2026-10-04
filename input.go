@@ -110,7 +110,7 @@ func (d *Dispatcher) handleInput(ctx context.Context, event InputEvent) bool {
 
 	d.mu.Lock()
 	state := d.stormForLocked(ref)
-	decision := state.observe(event.At)
+	decision := state.observe(event.At, d.hasPendingNoticeLocked(ref))
 	fresh := line.raise(event.Source, event.Seq)
 	d.mu.Unlock()
 
@@ -147,14 +147,26 @@ func (d *Dispatcher) handleRelease(ref sourceRef) {
 	}
 
 	remaining := state.release()
-	if source, pending := line.nextPending(); pending && source == ref.source {
-		d.nextNotice++
-		d.pending = append(d.pending, pendingNotice{
-			ref:      ref,
-			priority: line.cfg.Priority,
-			seq:      line.seqOf(source),
-			raisedAt: d.cfg.Clock.Now(),
-		})
+	// 放行只作用于本来源，与同线其他来源的待处理状态无关：
+	// 各来源的限速积压独立结算，先到者不顶替后到者的补投。
+	switch {
+	case line.undelivered(ref.source):
+		// 触发状态仍未投递：补投一次。若通知已在队则本次放行
+		// 合并进既有通知，不重复累积待处理条目。
+		if !d.hasPendingNoticeLocked(ref) {
+			d.nextNotice++
+			d.pending = append(d.pending, pendingNotice{
+				ref:      ref,
+				priority: line.cfg.Priority,
+				seq:      line.seqOf(ref.source),
+				raisedAt: d.cfg.Clock.Now(),
+			})
+		}
+	case line.inflight[ref.source]:
+		// 例程正在投递：折算为一次滞留，例程返回后补投，最终请求不丢失。
+		line.markRearmed(ref.source)
+	default:
+		// 已撤销或已投递：放行额度随积压结算，无需动作。
 	}
 	shouldArm := remaining > 0
 	if !shouldArm {

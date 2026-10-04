@@ -14,15 +14,24 @@ func (d *Dispatcher) stormForLocked(ref sourceRef) *stormState {
 	return state
 }
 
+// hasPendingNoticeLocked 报告指定“线+来源”是否已有待处理通知在队。
+// 调用方必须持有 d.mu。
+func (d *Dispatcher) hasPendingNoticeLocked(ref sourceRef) bool {
+	for _, existing := range d.pending {
+		if existing.ref == ref {
+			return true
+		}
+	}
+	return false
+}
+
 // enqueue 加入一个待处理通知；相同“线+来源”的在途/待处理通知只保留一个，
 // 序号记录最早到达，保证补投不重复。
 func (d *Dispatcher) enqueue(notice pendingNotice) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, existing := range d.pending {
-		if existing.ref == notice.ref {
-			return
-		}
+	if d.hasPendingNoticeLocked(notice.ref) {
+		return
 	}
 	if notice.seq == 0 {
 		d.nextNotice++
@@ -146,11 +155,12 @@ func (d *Dispatcher) schedule(ctx context.Context) {
 
 		line := d.lines[notice.ref.line]
 		if !line.beginDispatch(notice.ref.source) {
-			// 状态在锁内已变化（如被撤销/已在途）：放回队首，本轮不派发。
-			d.pending = append([]pendingNotice{notice}, d.pending...)
+			// 通知已过期（被撤销/已在途/已投递）：丢弃而非放回，
+			// 放回队首会让它永远无法派发并堵住后续所有通知。
+			// 在途投递与滞留补投由 inflight/rearmed 机制保证，不依赖此通知。
 			d.refreshBacklogLocked()
 			d.mu.Unlock()
-			return
+			continue
 		}
 
 		d.nextRun++
@@ -208,13 +218,19 @@ func (d *Dispatcher) updateQuiet() {
 }
 
 // hasNoWorkLocked 判定是否还有任何未完成工作：
-// inbox 输入、待处理通知、在途例程以及风暴限速积压。
+// inbox 输入、待处理通知、在途例程、风暴限速积压，
+// 以及任何尚未投递的边缘/电平触发状态。
 func (d *Dispatcher) hasNoWorkLocked() bool {
 	if len(d.pending) != 0 || len(d.running) != 0 || len(d.inbox) != 0 {
 		return false
 	}
 	for _, state := range d.storms {
 		if state.depth() > 0 {
+			return false
+		}
+	}
+	for _, line := range d.lines {
+		if line.backlog() > 0 {
 			return false
 		}
 	}

@@ -54,7 +54,9 @@ func (s *stormState) prune(now time.Time) {
 }
 
 // observe 记录一次输入并给出处置决策。合并与限速的存在性均不丢失。
-func (s *stormState) observe(now time.Time) StormDecision {
+// queued 表示该来源当前已有待处理通知在队：通知与限速积压共同构成
+// 该来源的未投递积压，二者合计不得突破 MaxBacklog，保证积压指标严格有界。
+func (s *stormState) observe(now time.Time, queued bool) StormDecision {
 	s.prune(now)
 	s.window = append(s.window, now)
 
@@ -73,7 +75,11 @@ func (s *stormState) observe(now time.Time) StormDecision {
 		s.suppressed++
 		return StormMerge
 	}
-	if s.backlog >= s.cfg.MaxBacklog {
+	held := s.backlog
+	if queued {
+		held++
+	}
+	if held >= s.cfg.MaxBacklog {
 		s.suppressed++
 		return StormMerge
 	}
