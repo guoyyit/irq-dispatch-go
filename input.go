@@ -101,6 +101,11 @@ func (d *Dispatcher) handleInput(ctx context.Context, event InputEvent) bool {
 		d.mu.Lock()
 		line.deassert(event.Source)
 		d.removePending(sourceRef{line: event.Line, source: event.Source})
+		// 撤销同时取消该来源尚未放行的限速积压，避免撤销后再补投。
+		if state := d.storms[sourceRef{line: event.Line, source: event.Source}]; state != nil {
+			state.cancel()
+		}
+		d.refreshBacklogLocked()
 		d.mu.Unlock()
 		return false
 	}
@@ -110,18 +115,30 @@ func (d *Dispatcher) handleInput(ctx context.Context, event InputEvent) bool {
 
 	d.mu.Lock()
 	state := d.stormForLocked(ref)
-	decision := state.observe(event.At)
-	fresh := line.raise(event.Source, event.Seq)
-	d.mu.Unlock()
-
+	decision := state.observe(event.At, line.undelivered(event.Source))
+	fresh := false
 	switch decision {
 	case StormMerge:
 		d.metrics.recordStormMerge()
-		d.trace(TraceStorm, event.Line, event.Source, "", line.cfg.Priority, event.At, "merge")
+		d.traceLocked(TraceStorm, event.Line, event.Source, "", line.cfg.Priority, event.At, "merge")
+		// 限速积压非空时，本次脉冲合并进积压，由放行机制保证最终投递；
+		// 否则（纯合并模式）脉冲登记到线状态，存在性不丢失。
+		if state.depth() == 0 {
+			fresh = line.raise(event.Source, event.Seq)
+		}
 	case StormDelay:
 		d.metrics.recordStormMerge()
 		d.metrics.recordDeferred()
-		d.trace(TraceStorm, event.Line, event.Source, "", line.cfg.Priority, event.At, "delay")
+		d.traceLocked(TraceStorm, event.Line, event.Source, "", line.cfg.Priority, event.At, "delay")
+		// 限速脉冲只计入风暴积压，不登记线状态；
+		// 由放行定时器按节奏逐条转移到线状态，避免重复累积。
+	default:
+		fresh = line.raise(event.Source, event.Seq)
+	}
+	d.refreshBacklogLocked()
+	d.mu.Unlock()
+
+	if decision == StormDelay {
 		d.armReleaseTimer(ref)
 		return false
 	}
@@ -146,15 +163,20 @@ func (d *Dispatcher) handleRelease(ref sourceRef) {
 		return
 	}
 
-	remaining := state.release()
-	if source, pending := line.nextPending(); pending && source == ref.source {
+	// 放行严格按来源独立进行：把本次放行的脉冲转移到该来源的线状态，
+	// 若产生新的待投递脉冲则入队通知；不依赖线内其他来源的状态。
+	released, remaining := state.release()
+	if released {
 		d.nextNotice++
-		d.pending = append(d.pending, pendingNotice{
-			ref:      ref,
-			priority: line.cfg.Priority,
-			seq:      line.seqOf(source),
-			raisedAt: d.cfg.Clock.Now(),
-		})
+		seq := d.nextNotice
+		if line.raise(ref.source, seq) {
+			d.pending = append(d.pending, pendingNotice{
+				ref:      ref,
+				priority: line.cfg.Priority,
+				seq:      seq,
+				raisedAt: d.cfg.Clock.Now(),
+			})
+		}
 	}
 	shouldArm := remaining > 0
 	if !shouldArm {

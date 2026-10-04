@@ -177,7 +177,12 @@ func (d *Dispatcher) schedule(ctx context.Context) {
 }
 
 func (d *Dispatcher) totalBacklogLocked() int {
-	total := len(d.pending)
+	// 线级未投递触发状态（与待处理通知一一对应，另含投递期间滞留的
+	// 补投脉冲）加上各来源的限速积压，如实反映全部未投递工作。
+	total := 0
+	for _, line := range d.lines {
+		total += line.backlog()
+	}
 	for _, state := range d.storms {
 		total += state.depth()
 	}
@@ -208,13 +213,19 @@ func (d *Dispatcher) updateQuiet() {
 }
 
 // hasNoWorkLocked 判定是否还有任何未完成工作：
-// inbox 输入、待处理通知、在途例程以及风暴限速积压。
+// inbox 输入、待处理通知、在途例程、风暴限速积压，
+// 以及任何已登记但尚未投递的边缘/电平触发状态。
 func (d *Dispatcher) hasNoWorkLocked() bool {
 	if len(d.pending) != 0 || len(d.running) != 0 || len(d.inbox) != 0 {
 		return false
 	}
 	for _, state := range d.storms {
 		if state.depth() > 0 {
+			return false
+		}
+	}
+	for _, line := range d.lines {
+		if line.backlog() > 0 {
 			return false
 		}
 	}

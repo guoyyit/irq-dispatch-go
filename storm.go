@@ -54,7 +54,9 @@ func (s *stormState) prune(now time.Time) {
 }
 
 // observe 记录一次输入并给出处置决策。合并与限速的存在性均不丢失。
-func (s *stormState) observe(now time.Time) StormDecision {
+// pending 为该来源当前已登记但尚未投递的触发状态数（0 或 1），
+// 与限速积压共享 MaxBacklog 预算，保证该来源未投递总量严格有界。
+func (s *stormState) observe(now time.Time, pending int) StormDecision {
 	s.prune(now)
 	s.window = append(s.window, now)
 
@@ -73,7 +75,7 @@ func (s *stormState) observe(now time.Time) StormDecision {
 		s.suppressed++
 		return StormMerge
 	}
-	if s.backlog >= s.cfg.MaxBacklog {
+	if s.backlog+pending >= s.cfg.MaxBacklog {
 		s.suppressed++
 		return StormMerge
 	}
@@ -81,14 +83,21 @@ func (s *stormState) observe(now time.Time) StormDecision {
 	return StormDelay
 }
 
-// release 在限速间隔到达后放行一个积压输入，返回是否仍有积压需要继续定时。
-func (s *stormState) release() (remaining int) {
+// release 在限速间隔到达后放行一个积压输入。
+// released 为 true 表示确实放行了一个脉冲；remaining 为剩余积压深度。
+func (s *stormState) release() (released bool, remaining int) {
+	s.timerArmed = false
 	if s.backlog > 0 {
 		s.backlog--
 		s.admitted++
+		return true, s.backlog
 	}
-	s.timerArmed = false
-	return s.backlog
+	return false, 0
+}
+
+// cancel 丢弃全部限速积压（如电平撤销时），在途定时器到期后自然空转。
+func (s *stormState) cancel() {
+	s.backlog = 0
 }
 
 // settled 在窗口内无新突发且积压清空后退出风暴状态。

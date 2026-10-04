@@ -101,23 +101,22 @@ func (l *irqLine) deassert(source SourceID) {
 	delete(l.inflight, source)
 }
 
-// nextPending 返回最早进入待处理状态且尚未投递的来源。
-func (l *irqLine) nextPending() (SourceID, bool) {
-	for _, source := range l.sourceOrder {
-		if l.cfg.Mode == EdgeTriggered && l.edges[source] == edgePending && !l.inflight[source] {
-			return source, true
+// undelivered 返回该来源已登记但尚未投递的触发状态数（0 或 1）：
+// 边缘待投递、投递期间滞留的补投脉冲，或电平已置位但尚未上报。
+func (l *irqLine) undelivered(source SourceID) int {
+	if l.cfg.Mode == EdgeTriggered {
+		if l.edges[source] == edgeRearmed {
+			return 1
 		}
-		if l.cfg.Mode == LevelTriggered && l.levelAsserted[source] && !l.levelReported[source] {
-			return source, true
+		if l.edges[source] == edgePending && !l.inflight[source] {
+			return 1
 		}
+		return 0
 	}
-	return "", false
-}
-
-// hasPending 报告线上是否仍有待投递来源。
-func (l *irqLine) hasPending() bool {
-	_, ok := l.nextPending()
-	return ok
+	if l.levelAsserted[source] && !l.levelReported[source] {
+		return 1
+	}
+	return 0
 }
 
 // beginDispatch 在调度临界区内原子地开始一次投递：
@@ -169,16 +168,11 @@ func (l *irqLine) markDelivered(source SourceID) bool {
 	return false
 }
 
-// backlog 返回线上尚未投递的来源数。
+// backlog 返回线上尚未投递的触发状态数（含投递期间滞留的补投脉冲）。
 func (l *irqLine) backlog() int {
 	count := 0
 	for _, source := range l.sourceOrder {
-		if l.cfg.Mode == EdgeTriggered && l.edges[source] == edgePending && !l.inflight[source] {
-			count++
-		}
-		if l.cfg.Mode == LevelTriggered && l.levelAsserted[source] && !l.levelReported[source] {
-			count++
-		}
+		count += l.undelivered(source)
 	}
 	return count
 }
